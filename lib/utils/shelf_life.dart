@@ -1,0 +1,539 @@
+// ตารางอายุการเก็บรักษาวัตถุดิบ (ค่ากลางมาตรฐาน / Default Expiration)
+// อ้างอิงจากข้อมูลที่รวบรวมไว้ (ที่มา: springnews, The Beefchelor, SUPALAI,
+// Maeban) — ใช้เป็นค่าเริ่มต้นตอนสแกนวัตถุดิบเข้าตู้เย็น ถ้าวัตถุดิบไม่ตรงกับ
+// ประเภทไหนในตารางนี้ จะใช้จำนวนวันที่ Gemini ประเมินให้แทน และผู้ใช้ยังแก้
+// วันหมดอายุเองได้เสมอ
+
+/// ช่องที่เก็บในตู้เย็น
+const String storageFridge = 'fridge'; // ช่องเย็นปกติ (ค่าที่บันทึกในฐานข้อมูล)
+const String storageFreezer = 'freezer'; // ช่องแช่แข็ง
+
+// [UI] ชื่อช่องที่แสดงบนจอ (แก้คำได้ที่นี่)
+String storageLabel(String? storage) =>
+    storage == storageFreezer ? 'ช่องแช่แข็ง' : 'ช่องปกติ';
+
+// [UI] อิโมจิของช่อง: ช่องแช่แข็ง = ❄️, ช่องปกติ = 🧊
+String storageEmoji(String? storage) => storage == storageFreezer ? '❄️' : '🧊';
+
+/// อายุการเก็บรักษาของวัตถุดิบหนึ่งสถานะ (หน่วยเป็นวัน)
+/// - fridgeMin/fridgeMax: ช่องปกติ (ถ้าเป็นช่วง เช่น 3-5 วัน ให้ Gemini เลือก
+///   ค่าในช่วงนี้ตามชนิดจริงของวัตถุดิบ)
+/// - freezer: ช่องแช่แข็ง (null = ไม่มีข้อมูลช่องแช่แข็ง → ไม่มีตัวเลือกช่องแช่แข็ง)
+/// - fridgeSource/freezerSource: แหล่งอ้างอิงของตัวเลขแต่ละช่อง (บางบรรทัดมาจาก
+///   แหล่งเดียว บางบรรทัดยืนยันจาก 2 แหล่ง) null = ใช้แหล่งของประเภทนั้น
+class ShelfLife {
+  final int? fridgeMin; // ช่องปกติ เก็บได้อย่างน้อยกี่วัน
+  final int? fridgeMax; // ช่องปกติ เก็บได้มากสุดกี่วัน
+  final int? freezer; // ช่องแช่แข็ง เก็บได้กี่วัน
+  final String? fridgeSource; // แหล่งอ้างอิงของตัวเลขช่องปกติ
+  final String? freezerSource; // แหล่งอ้างอิงของตัวเลขช่องแช่แข็ง
+
+  const ShelfLife({
+    this.fridgeMin,
+    int? fridgeMax,
+    this.freezer,
+    this.fridgeSource,
+    this.freezerSource,
+  }) : fridgeMax = fridgeMax ?? fridgeMin; // ไม่ระบุค่ามากสุด = เท่าค่าน้อยสุด (ค่าตายตัว)
+}
+
+/// ประเภทวัตถุดิบในตาราง
+class ShelfType {
+  final String key; // รหัสประเภท (ภาษาอังกฤษ บันทึกในฐานข้อมูล)
+  final String label; // ชื่อประเภทภาษาไทย (แสดงบนจอ)
+
+  /// สถานะที่ให้ผู้ใช้เลือก (เช่น ดิบ/สุก, เปิดซองแล้ว/ยังไม่เปิดซอง) ตัวแรก
+  /// คือค่าเริ่มต้น — ถ้าไม่มีสถานะให้เลือกจะใช้คีย์ว่าง ''
+  final Map<String, ShelfLife> states;
+
+  /// true = ไม่ควรเก็บในช่องแช่แข็ง (เช่น ไข่) ผู้ใช้จะเลือกช่องแช่แข็งไม่ได้
+  final bool noFreeze;
+
+  /// แหล่งอ้างอิงของข้อมูลประเภทนี้ (แสดงให้ผู้ใช้เห็นว่าตัวเลขมาจากไหน)
+  final String source;
+
+  const ShelfType({
+    required this.key,
+    required this.label,
+    required this.states,
+    this.noFreeze = false,
+    this.source = _srcSpring,
+  });
+
+  // ชื่อสถานะทั้งหมดที่เลือกได้ (ตัดสถานะว่างออก)
+  List<String> get stateNames =>
+      states.keys.where((s) => s.isNotEmpty).toList();
+
+  /// แหล่งอ้างอิงของตัวเลขตามสถานะ (ดิบ/สุก ฯลฯ) และช่องที่เก็บ
+  /// null = ไม่มีข้อมูลอ้างอิงของช่องนั้น (เช่น ผัก ผลไม้ ไข่ ในช่องแช่แข็ง)
+  String? sourceFor(String? state, String? storage) {
+    if (storage == storageFreezer && !hasFreezerData(state)) return null; // ไม่มีข้อมูลช่องแช่แข็ง
+    final rule = states[state] ?? states.values.first; // หาข้อมูลของสถานะนี้ (ไม่เจอใช้ตัวแรก)
+    final specific = storage == storageFreezer
+        ? rule.freezerSource
+        : rule.fridgeSource;
+    return specific ?? source; // ไม่มีแหล่งเฉพาะ ใช้แหล่งของประเภท
+  }
+
+  /// มีข้อมูลช่องแช่แข็งจากแหล่งอ้างอิงไหม — ไม่มี: ของที่สแกนใช้จำนวนวันที่ AI
+  /// ประเมิน (เป็นหน้าที่ของ AI เมื่อระบบไม่มีข้อมูล) ของที่กรอกเองให้ผู้ใช้กรอก
+  bool hasFreezerData(String? state) {
+    if (noFreeze) return false;
+    final rule = states[state] ?? states.values.first;
+    return rule.freezer != null;
+  }
+}
+
+// แหล่งอ้างอิง (สไลด์อายุการเก็บรักษา: S = springnews, B = The Beefchelor,
+// SU = SUPALAI, M = Maeban) — ใส่ตามที่มาของตัวเลขแต่ละบรรทัด
+const String _srcSpring = 'springnews';
+const String _srcBeef = 'The Beefchelor';
+const String _srcSpringBeef = 'springnews, The Beefchelor';
+const String _srcSupalai = 'SUPALAI';
+const String _srcMaeban = 'Maeban';
+
+/// หน่วยสำหรับ "นับเป็นชิ้น" (ของที่นับได้ ไม่ต้องชั่ง) — "แบ่งเป็นส่วน" ใช้
+/// หน่วย "ส่วน" ใช้ร่วมกันทั้งหน้าผลสแกนและหน้ารายละเอียด
+const List<String> pieceUnits = [
+  "ชิ้น",
+  "ฟอง",
+  "ผล",
+  "ลูก",
+  "แผ่น",
+  "หัว",
+  "ต้น",
+  "กำ",
+  "แพ็ค",
+  "ขวด",
+  "กล่อง",
+];
+
+const String portionUnit = 'ส่วน'; // หน่วยของ "แบ่งเป็นส่วน"
+
+/// shelf_type ที่บันทึกเมื่อผู้ใช้แก้ระยะที่เก็บได้เอง — เก็บเป็น
+/// "custom:<ประเภทเดิม>:<จำนวนวันเดิม>" เช่น "custom:egg:21" เพื่อจำที่มาเดิม
+/// ไว้ ถ้าผู้ใช้แก้กลับเป็นค่าเดิม จะได้คืนที่มาเดิมได้ (ค่าเก่าที่เป็นแค่
+/// "custom" เฉยๆ ถือว่าไม่รู้ที่มาเดิม)
+const String shelfTypeCustom = 'custom';
+
+/// สร้างค่า shelf_type สำหรับ "ผู้ใช้กำหนดเอง" โดยจำประเภทและจำนวนวันเดิมไว้
+String customShelfType(String? originalKey, num? originalDays) =>
+    '$shelfTypeCustom:${originalKey ?? ''}:${originalDays?.round() ?? ''}';
+
+// เป็นค่า "ผู้ใช้กำหนดเอง" หรือเปล่า
+bool isCustomShelfType(String? value) =>
+    value != null &&
+    (value == shelfTypeCustom || value.startsWith('$shelfTypeCustom:'));
+
+/// ที่มาเดิมก่อนผู้ใช้แก้ — key = ประเภทเดิม (null = AI ประเมิน), days =
+/// จำนวนวันเดิม (null = ไม่รู้) — ถ้าไม่ใช่ค่า custom คืนตัวเดิมกลับไป
+({String? key, int? days}) originalShelfSource(
+  String? value,
+  num? currentDays,
+) {
+  if (!isCustomShelfType(value)) { // ไม่ใช่ค่ากำหนดเอง -> ค่าปัจจุบันคือค่าเดิม
+    return (key: value, days: currentDays?.round());
+  }
+  final parts = value!.split(':'); // แยก "custom:egg:21" -> [custom, egg, 21]
+  String? at(int i) =>
+      parts.length > i && parts[i].isNotEmpty ? parts[i] : null;
+  return (key: at(1), days: int.tryParse(at(2) ?? ''));
+}
+
+/// ช่วงจำนวนวันตามตาราง ของประเภท/สถานะ/ช่องที่เก็บ — null = ตารางไม่มีข้อมูล
+/// (ไม่อยู่ในตาราง หรือช่องแช่แข็งของประเภทที่ไม่มีข้อมูล)
+({int min, int max})? tableShelfRange(
+  String? typeKey, // รหัสประเภท เช่น 'bread'
+  String? state, // สถานะ เช่น ดิบ/สุก
+  String? storage, // ช่องที่เก็บ
+) {
+  final type = findShelfType(typeKey); // หาประเภทในตาราง
+  if (type == null) return null; // ไม่อยู่ในตาราง
+  final rule = type.states[state] ?? type.states.values.first; // ข้อมูลของสถานะนี้ (ไม่เจอใช้ตัวแรก)
+  if (storage == storageFreezer) { // ช่องแช่แข็ง
+    if (!type.hasFreezerData(state)) return null; // ไม่มีข้อมูลช่องแช่แข็ง
+    return (min: rule.freezer!, max: rule.freezer!); // ค่าตายตัว
+  }
+  if (rule.fridgeMin == null) return null; // ไม่มีข้อมูลช่องปกติ
+  return (min: rule.fridgeMin!, max: rule.fridgeMax!); // ช่วงของช่องปกติ
+}
+
+// จำนวนวันที่เก็บได้ของช่องที่เก็บอยู่ตอนนี้ (ค่าที่บันทึกไว้ ไม่ปรับอะไร)
+int? _savedShelfDays(Map<String, dynamic> item) {
+  final raw = item['storage'] == storageFreezer
+      ? item['freezer_days'] // อยู่ช่องแช่แข็ง
+      : item['fridge_days']; // อยู่ช่องปกติ
+  final v = raw is num ? raw : num.tryParse(raw?.toString() ?? ''); // แปลงเป็นตัวเลข
+  return (v == null || v <= 0) ? null : v.round(); // ไม่มีค่า/ติดลบ = null
+}
+
+/// ค่าแนะนำของวัตถุดิบชิ้นนี้ (key = ประเภท, days = จำนวนวันแนะนำ)
+/// - ตารางมีค่าตายตัว (เช่น ขนมปัง 3 วัน): ใช้ค่าจากตารางเสมอ ไม่เชื่อค่าที่จำไว้
+///   เพราะค่าที่จำไว้อาจเพี้ยนได้หลังแก้วัน/ย้ายช่องหลายรอบ
+/// - ตารางเป็นช่วง (เช่น ผักใบ 3-5 วัน): ใช้ค่าที่ AI เลือกไว้ (จำไว้ตอนผู้ใช้แก้)
+///   แต่ต้องอยู่ในช่วงของตาราง
+/// - ไม่มีในตาราง: ใช้ค่าที่จำไว้ (AI ประเมิน)
+({String? key, int? days}) recommendedShelf(Map<String, dynamic> item) {
+  final value = item['shelf_type']?.toString(); // ค่าที่บันทึกไว้ เช่น 'bread' หรือ 'custom:bread:3'
+  final original = originalShelfSource( // ที่มาเดิม (ค่าที่ไม่ใช่ custom = ค่าตอนนี้คือค่าเดิม)
+    value,
+    isCustomShelfType(value) ? null : _savedShelfDays(item),
+  );
+  final range = tableShelfRange( // ช่วงตามตาราง
+    original.key,
+    item['food_state']?.toString(),
+    item['storage']?.toString(),
+  );
+  if (range == null) { // ตารางไม่มีข้อมูลของช่องนี้
+    // ย้ายเข้าช่องแช่แข็งของประเภทที่ไม่มีข้อมูลช่องแช่แข็ง (เช่น ขนมปัง ผัก):
+    // ค่าแนะนำ = วันที่เหลืออยู่ตอนย้ายเข้า (นับต่อเท่าเดิม ไม่ต่อเวลาให้)
+    // ไม่ใช้ค่าที่จำไว้ เพราะอาจเป็นค่าของช่องปกติ
+    if (item['storage'] == storageFreezer && findShelfType(original.key) != null) {
+      final raw = item['days_left_at_freeze']; // วันที่เหลือตอนย้ายเข้าช่องแช่แข็ง
+      final atFreeze = raw is num ? raw.round() : int.tryParse(raw?.toString() ?? '');
+      if (atFreeze != null) {
+        return (key: original.key, days: atFreeze < 0 ? 0 : atFreeze); // ติดลบ = 0
+      }
+    }
+    return original; // ใช้ค่าที่จำไว้ (AI ประเมิน / ผู้ใช้แก้ในช่องนี้)
+  }
+  if (range.min == range.max) return (key: original.key, days: range.min); // ค่าตายตัว ใช้ค่าตาราง
+  final days = original.days; // ค่าที่ AI เลือกในช่วง
+  if (days == null) return (key: original.key, days: range.min); // ไม่รู้ -> ใช้ค่าต่ำสุดของช่วง (ปลอดภัย)
+  return (key: original.key, days: days.clamp(range.min, range.max)); // บังคับให้อยู่ในช่วง
+}
+
+/// ค่า shelf_type ที่ควรบันทึกเมื่อผู้ใช้ตั้งจำนวนวันเป็น [days]: เท่าค่าแนะนำ =
+/// ใช้ที่มาเดิม (เช่น 'bread'), ไม่เท่า = "คุณกำหนดเอง" โดยจำค่าแนะนำไว้
+String? shelfTypeForDays(Map<String, dynamic> item, int days) {
+  final rec = recommendedShelf(item); // ค่าแนะนำ
+  return (rec.days != null && days == rec.days)
+      ? rec.key // เท่าค่าแนะนำ
+      : customShelfType(rec.key, rec.days); // ผู้ใช้กำหนดเอง
+}
+
+// ชื่อสถานะของวัตถุดิบ (แสดงเป็นตัวเลือกบนจอ)
+const String stateRaw = 'ดิบ';
+const String stateCooked = 'สุก';
+const String stateOpened = 'เปิดซองแล้ว';
+const String stateUnopened = 'ยังไม่เปิดซอง';
+
+// ตารางอายุการเก็บของแต่ละประเภท — เพิ่ม/แก้จำนวนวันได้ที่นี่
+// fridgeMin = ช่องปกติ (วัน), freezer = ช่องแช่แข็ง (วัน), noFreeze = ไม่ควรแช่แข็ง
+const List<ShelfType> shelfTypes = [
+  ShelfType(
+    key: 'chicken',
+    label: 'เนื้อไก่',
+    states: {
+      stateRaw: ShelfLife(
+        fridgeMin: 2,
+        freezer: 120,
+        fridgeSource: _srcBeef,
+        freezerSource: _srcSpring,
+      ),
+      stateCooked: ShelfLife(fridgeMin: 3, fridgeSource: _srcBeef),
+    },
+  ),
+  ShelfType(
+    key: 'beef_pork',
+    label: 'เนื้อวัว, เนื้อหมู',
+    states: {
+      stateRaw: ShelfLife(
+        fridgeMin: 3,
+        freezer: 120,
+        fridgeSource: _srcSpringBeef,
+      ),
+      stateCooked: ShelfLife(
+        fridgeMin: 3,
+        freezer: 60,
+        fridgeSource: _srcSpringBeef,
+      ),
+    },
+  ),
+  ShelfType(
+    key: 'ground_meat',
+    label: 'เนื้อบด',
+    states: {'': ShelfLife(fridgeMin: 1, freezer: 90)},
+  ),
+  ShelfType(
+    key: 'offal',
+    label: 'เครื่องในสัตว์',
+    states: {'': ShelfLife(fridgeMin: 2, freezer: 90)},
+  ),
+  ShelfType(
+    key: 'fish',
+    label: 'ปลา',
+    states: {'': ShelfLife(fridgeMin: 2, freezer: 180)},
+  ),
+  ShelfType(
+    key: 'shellfish',
+    label: 'หอย',
+    states: {'': ShelfLife(fridgeMin: 2, freezer: 90)},
+  ),
+  ShelfType(
+    key: 'processed_meat',
+    label: 'ไส้กรอก แฮม เบคอน หรืออาหารแปรรูป',
+    states: {
+      stateUnopened: ShelfLife(fridgeMin: 14, freezer: 30),
+      stateOpened: ShelfLife(fridgeMin: 7, freezer: 30),
+    },
+  ),
+  ShelfType(
+    key: 'egg',
+    label: 'ไข่',
+    states: {
+      stateRaw: ShelfLife(fridgeMin: 21),
+      stateCooked: ShelfLife(fridgeMin: 7),
+    },
+    noFreeze: true,
+  ),
+  ShelfType(
+    key: 'leftover',
+    label: 'อาหารกินเหลือ',
+    states: {'': ShelfLife(fridgeMin: 2)},
+  ),
+  ShelfType(
+    key: 'bread',
+    label: 'ขนมปัง',
+    states: {'': ShelfLife(fridgeMin: 3)},
+    source: _srcSupalai,
+  ),
+  ShelfType(
+    key: 'leafy_veg',
+    label: 'ผักใบ',
+    states: {'': ShelfLife(fridgeMin: 3, fridgeMax: 5)},
+    source: _srcMaeban,
+  ),
+  ShelfType(
+    key: 'root_veg',
+    label: 'ผักหัว',
+    states: {'': ShelfLife(fridgeMin: 7, fridgeMax: 15)},
+    source: _srcMaeban,
+  ),
+  ShelfType(
+    key: 'fruit',
+    label: 'ผลไม้',
+    // ไม่มีข้อมูลช่องแช่แข็งจากแหล่งอ้างอิง -> ไม่มีตัวเลือกช่องแช่แข็ง
+    states: {'': ShelfLife(fridgeMin: 3, fridgeMax: 15)},
+    source: _srcMaeban,
+  ),
+  ShelfType(
+    key: 'milk',
+    label: 'นม',
+    states: {'': ShelfLife(fridgeMin: 4)},
+    source: _srcSupalai,
+  ),
+  ShelfType(
+    key: 'yogurt',
+    label: 'โยเกิร์ต',
+    states: {'': ShelfLife(fridgeMin: 3)},
+    source: _srcSupalai,
+  ),
+];
+
+// หาประเภทจากรหัส (ไม่เจอ = null)
+ShelfType? findShelfType(String? key) {
+  if (key == null) return null;
+  for (final t in shelfTypes) { // ไล่หาในตาราง
+    if (t.key == key) return t;
+  }
+  return null;
+}
+
+/// รายการประเภทสำหรับใส่ใน prompt ของ Gemini ให้เลือกว่าวัตถุดิบตรงกับ
+/// ประเภทไหน (หรือ "other" ถ้าไม่ตรงกับประเภทไหนเลย)
+String shelfTypePromptList() =>
+    shelfTypes.map((t) => '${t.key} = ${t.label}').join('\n');
+
+/// จำนวนวันที่เก็บได้ในแต่ละช่อง (ผลลัพธ์หลังรวมตารางกับค่าที่ Gemini ประเมิน)
+/// freezerDays = null แปลว่าไม่ควรเก็บในช่องแช่แข็ง
+class ResolvedShelfLife {
+  final int fridgeDays; // ช่องปกติเก็บได้กี่วัน
+  final int? freezerDays; // ช่องแช่แข็งเก็บได้กี่วัน (null = ไม่มีข้อมูล)
+  final bool fromTable; // true = ได้จากตาราง, false = AI ประเมิน
+
+  const ResolvedShelfLife({
+    required this.fridgeDays,
+    required this.freezerDays,
+    required this.fromTable,
+  });
+
+  // จำนวนวันของช่องที่ระบุ
+  int? daysFor(String storage) =>
+      storage == storageFreezer ? freezerDays : fridgeDays;
+}
+
+// แปลงค่าเป็นจำนวนเต็ม (ปัดเศษ)
+int? _toInt(dynamic v) {
+  if (v == null) return null;
+  if (v is num) return v.round();
+  return num.tryParse(v.toString())?.round();
+}
+
+/// รวมค่าจากตารางกับค่าที่ Gemini ประเมิน:
+/// - ถ้าตารางมีค่าแบบตายตัว ใช้ค่าตาราง
+/// - ถ้าตารางเป็นช่วง (เช่น ผักใบ 3-5 วัน) ใช้ค่าของ Gemini แต่บังคับให้อยู่
+///   ในช่วงของตาราง (ถ้า Gemini ไม่ให้ค่ามา ใช้ค่าต่ำสุดของช่วงเพื่อความปลอดภัย)
+/// - ช่องแช่แข็ง: ถ้าตรงประเภทในตารางแต่ไม่มีข้อมูลช่องแช่แข็ง (เช่น ผัก นม)
+///   จะไม่มีตัวเลือกช่องแช่แข็งเลย (freezerDays = null) ไม่ใช้ค่าที่ Gemini เดา
+/// - ถ้าไม่ตรงประเภทไหนในตารางเลย ใช้ค่าของ Gemini ทั้งสองช่อง
+ResolvedShelfLife resolveShelfLife({
+  required String? typeKey,
+  required String? state,
+  dynamic geminiFridgeDays,
+  dynamic geminiFreezerDays,
+}) {
+  final gFridge = _toInt(geminiFridgeDays); // ค่าที่ AI ประเมิน (ช่องปกติ)
+  final gFreezer = _toInt(geminiFreezerDays); // ค่าที่ AI ประเมิน (ช่องแช่แข็ง)
+  final type = findShelfType(typeKey); // ประเภทในตาราง
+
+  if (type == null) { // ไม่อยู่ในตาราง -> ใช้ค่าของ AI
+    return ResolvedShelfLife(
+      fridgeDays: (gFridge != null && gFridge > 0) ? gFridge : 3, // AI ไม่ให้ค่า -> 3 วัน (ค่าปลอดภัย)
+      freezerDays: (gFreezer != null && gFreezer > 0) ? gFreezer : null,
+      fromTable: false,
+    );
+  }
+
+  final rule = type.states[state] ?? type.states.values.first; // ข้อมูลของสถานะนี้
+
+  int fridgeDays;
+  if (rule.fridgeMin == null) { // ตารางไม่มีค่าช่องปกติ -> ใช้ AI
+    fridgeDays = (gFridge != null && gFridge > 0) ? gFridge : 3;
+  } else if (rule.fridgeMax != rule.fridgeMin) { // ตารางเป็นช่วง -> ใช้ค่า AI แต่บีบให้อยู่ในช่วง
+    fridgeDays = (gFridge ?? rule.fridgeMin!).clamp(
+      rule.fridgeMin!,
+      rule.fridgeMax!,
+    );
+  } else { // ตารางเป็นค่าตายตัว -> ใช้ค่าตาราง
+    fridgeDays = rule.fridgeMin!;
+  }
+
+  final int? freezerDays = type.noFreeze ? null : rule.freezer; // ห้ามแช่แข็ง = null
+
+  return ResolvedShelfLife(
+    fridgeDays: fridgeDays,
+    freezerDays: freezerDays,
+    fromTable: true,
+  );
+}
+
+/// สถานะเริ่มต้นของประเภทนั้น ('' ถ้าไม่มีสถานะให้เลือก)
+String defaultStateFor(String? typeKey) {
+  final type = findShelfType(typeKey);
+  if (type == null) return '';
+  return type.states.keys.first;
+}
+
+/// แปลงจำนวนวันให้อ่านง่าย (เกิน 2 เดือนแสดงเป็นเดือน)
+String formatShelfDays(int days) {
+  if (days >= 60 && days % 30 == 0) return '${days ~/ 30} เดือน'; // 60 วันขึ้นไปและหาร 30 ลงตัว -> แสดงเป็นเดือน
+  return '$days วัน';
+}
+
+/// ที่มาของระยะที่เก็บได้แบบสั้น สำหรับแสดงบนการ์ดเลยโดยไม่ต้องกดดู
+/// (ใช้คำที่ผู้ใช้เข้าใจ ไม่พูดถึง "ตาราง" ที่เป็นเรื่องภายในระบบ)
+String shelfSourceShort(Map<String, dynamic> item) {
+  final value = item['shelf_type']?.toString(); // ค่าที่บันทึกไว้ เช่น 'bread' หรือ 'custom:bread:3'
+  final rec = recommendedShelf(item); // ค่าแนะนำ (ค่าตายตัวดูจากตารางเสมอ)
+  final current = _savedShelfDays(item); // จำนวนวันที่ตั้งไว้ตอนนี้
+  // ผู้ใช้กำหนดเอง = จำนวนวันไม่ตรงค่าแนะนำ (แม้ป้ายที่บันทึกไว้จะบอกว่ามาจากตาราง
+  // ก็ตาม) — ถ้าแก้กลับมาเท่าค่าแนะนำ ก็กลับไปแสดงแหล่งข้อมูลเดิม
+  final custom = (current == null || rec.days == null)
+      ? isCustomShelfType(value) // เทียบไม่ได้ ใช้ป้ายที่บันทึกไว้
+      : current != rec.days; // ไม่ตรงค่าแนะนำ = กำหนดเอง
+  if (custom) { // ผู้ใช้แก้เอง
+    return rec.days == null // ส่งผลลัพธ์กลับ (เงื่อนไข/ค่าต่อบรรทัดถัดไป)
+        ? 'คุณกำหนดเอง'
+        : 'คุณกำหนดเอง (ค่าแนะนำ ${formatShelfDays(rec.days!)})'; // บอกค่าแนะนำด้วย
+  }
+  final type = findShelfType(rec.key); // ประเภทเดิม
+  if (type != null) {
+    final src = type.sourceFor(
+      item['food_state']?.toString(),
+      item['storage']?.toString(),
+    );
+    if (src != null) return 'ข้อมูลจาก $src'; // มีแหล่งอ้างอิง
+    // ไม่มีข้อมูลช่องแช่แข็งในระบบ: สแกนเข้าช่องแช่แข็งตั้งแต่แรก = AI ประเมิน
+    // (ย้ายเข้าช่องแช่แข็งทีหลัง = นับวันที่เหลือเดิมต่อ) — เตือนเฉพาะของที่ไม่ควร
+    // แช่แข็ง (ไข่)
+    final base = item['storage_changed_at'] == null
+        ? 'AI ประเมินให้ ควรตรวจสอบอีกครั้ง'
+        : 'นับวันที่เหลือต่อจากช่องปกติ';
+    return type.noFreeze ? '$base · $freezerNotRecommendedText' : base;
+  }
+  if (item['fridge_days'] != null) return 'AI ประเมินให้ ควรตรวจสอบอีกครั้ง'; // ไม่อยู่ในตาราง แต่มีค่าจาก AI
+  return 'ไม่มีข้อมูลระยะที่เก็บได้'; // ของเก่าไม่มีข้อมูล
+}
+
+/// คำเตือนสำหรับของที่ไม่ควรแช่แข็ง (ไข่) — ผู้ใช้ยังเลือกเก็บช่องแช่แข็งได้
+const String freezerNotRecommendedText = 'ไม่แนะนำให้เก็บในช่องแช่แข็ง';
+
+/// ควรเตือนว่าไม่แนะนำให้แช่แข็งไหม (ตามประเภทเดิมก่อนผู้ใช้แก้วัน) — เฉพาะไข่
+bool freezerNotRecommended(Map<String, dynamic> item) {
+  final key = originalShelfSource(item['shelf_type']?.toString(), null).key;
+  return findShelfType(key)?.noFreeze ?? false;
+}
+
+/// ชนิดของเมื่อเกินระยะที่เก็บได้แล้ว: ไม่ควรเสี่ยง (ทิ้ง) / ตรวจด้วยตาได้
+enum OverdueKind { unsafe, produce, other }
+
+// จัดชนิดของที่เกินกำหนดแล้ว ว่าควรทิ้งเลย หรือตรวจด้วยตาได้
+OverdueKind overdueKind(Map<String, dynamic> item) {
+  // ของที่ผู้ใช้แก้เอง ใช้ประเภทเดิมก่อนแก้
+  final key = originalShelfSource(item['shelf_type']?.toString(), null).key;
+  // ประเภทที่ไม่ควรเสี่ยง (เกินกำหนดแล้วให้ทิ้ง)
+  const unsafe = {
+    'chicken',
+    'beef_pork',
+    'ground_meat',
+    'offal',
+    'fish',
+    'shellfish',
+    'leftover',
+  };
+  const produce = {'leafy_veg', 'root_veg', 'fruit'}; // ผัก/ผลไม้ (ตรวจด้วยตาได้)
+
+  if (findShelfType(key) != null) {
+    if (unsafe.contains(key) ||
+        (key == 'processed_meat' && item['food_state'] == stateOpened)) {
+      return OverdueKind.unsafe;
+    }
+    if (produce.contains(key)) return OverdueKind.produce;
+    return OverdueKind.other;
+  }
+  // ไม่รู้ประเภท (AI ประเมิน / ของเก่า) ดูจากหมวดหมู่แทน
+  final category = item['category']?.toString() ?? '';
+  if (category.contains('เนื้อ')) return OverdueKind.unsafe;
+  if (category.contains('ผัก') || category.contains('ผลไม้')) {
+    return OverdueKind.produce;
+  }
+  return OverdueKind.other;
+}
+
+/// คำแนะนำบนการ์ดเมื่อเกินระยะที่เก็บได้แล้ว แยกตามชนิดของ — เนื้อสัตว์/อาหาร
+/// ทะเล/อาหารกินเหลือไม่ควรเสี่ยง ส่วนผักผลไม้ตรวจด้วยตาได้
+///
+/// ของที่ต่อเวลาได้ ข้อความนี้คือคำแนะนำ "ถ้าไม่มีฉลาก" (กล่องคำเตือนบอกให้ดูวัน
+/// ควรบริโภคก่อน / หมดอายุ บนฉลากก่อน ดู OverdueNotice)
+/// ที่มา: แบคทีเรียก่อโรคโดยทั่วไปไม่ทำให้กลิ่น รส หรือหน้าตาของอาหารเปลี่ยน
+/// (USDA FSIS) จึงตรวจเนื้อสัตว์/อาหารเหลือด้วยตาหรือจมูกไม่ได้
+String overdueAdvice(Map<String, dynamic> item) {
+  switch (overdueKind(item)) {
+    case OverdueKind.unsafe:
+      return 'ควรทิ้ง แม้ดูและดมปกติก็อาจมีเชื้อโรค';
+    case OverdueKind.produce:
+      return 'ไม่เน่า ไม่เละ ไม่มีรา ใช้ได้';
+    case OverdueKind.other:
+      // ราในขนมปังลามลึกกว่าที่ตาเห็น เห็นจุดเดียวก็ควรทิ้งทั้งหมด
+      final key = originalShelfSource(item['shelf_type']?.toString(), null).key;
+      if (key == 'bread') {
+        return 'มีราแม้จุดเดียว ทิ้งทั้งหมด';
+      }
+      return 'กลิ่นหรือสภาพผิดปกติ ควรทิ้ง';
+  }
+}
+
+/// ตรวจแล้วยังใช้ได้ ให้ต่อเวลาได้ไหม — ของที่ไม่ควรเสี่ยงไม่มีปุ่มนี้
+bool canExtendOverdue(Map<String, dynamic> item) =>
+    overdueKind(item) != OverdueKind.unsafe;
